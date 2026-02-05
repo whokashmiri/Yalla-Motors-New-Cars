@@ -1,0 +1,4 @@
+nodriver
+motor
+pymongo
+python-dotenv
