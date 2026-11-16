@@ -12,6 +12,7 @@ from urllib.parse import urljoin
 
 from .log import log
 from .selectors import RESULT_ANCHOR_SEL
+from .popups import install_popup_guard, dismiss_popups
 from ..db.mongo import get_db, get_collection_name
 
 BASE = "https://ksa.yallamotor.com"
@@ -68,10 +69,12 @@ async def navigate_in_tab(tab: Any, url: str) -> None:
     if hasattr(tab, "get"):
         try:
             await tab.get(url)
+            await dismiss_popups(tab)
             return
         except Exception:
             pass
     await tab.evaluate(f"window.location.href = {json.dumps(url)}")
+    await dismiss_popups(tab)
 
 
 async def wait_for_any_anchor(tab: Any, timeout: float = 45.0) -> bool:
@@ -88,11 +91,12 @@ async def wait_for_any_anchor(tab: Any, timeout: float = 45.0) -> bool:
         pass
 
     while time.time() < end:
+        await dismiss_popups(tab)
         try:
             n = await tab.evaluate(
                 f"document.querySelectorAll({RESULT_ANCHOR_SEL!r}).length"
             )
-            if int(n) > 0:
+            if int(unwrap_js_value(n) or 0) > 0:
                 return True
         except Exception:
             pass
@@ -102,11 +106,54 @@ async def wait_for_any_anchor(tab: Any, timeout: float = 45.0) -> bool:
 
 
 async def extract_listing_hrefs(tab: Any) -> List[str]:
+    # scroll through the whole page so every card section is rendered
+    try:
+        for _ in range(20):
+            at_bottom = unwrap_js_value(await tab.evaluate(
+                "(() => { window.scrollBy(0, 1200); "
+                "return window.innerHeight + window.scrollY >= document.body.scrollHeight - 50; })()"
+            ))
+            await asyncio.sleep(0.3)
+            if at_bottom:
+                break
+    except Exception:
+        pass
+
     js = f"""(() => {{
       const sel = {RESULT_ANCHOR_SEL!r};
-      const links = Array.from(document.querySelectorAll(sel))
-        .map(a => a.getAttribute('href') || '')
-        .filter(Boolean);
+      const hrefOf = (el) => (el && (el.getAttribute('href') || el.getAttribute('data-filter-href'))) || '';
+      const isCar = (h) => /\\/new-cars\\/[^/?#]+\\/[^/?#]+/.test(h) && !/\\/new-cars\\/(search|prices)/.test(h);
+      const depth = (h) => h.split('?')[0].split('/').filter(Boolean).length;
+
+      // Card variants (all seen live, 2026-11):
+      //  A) inventory ad: section > div > div[data-ad-id] > article (title link in h3#car-title-*)
+      //  B) featured slider ad: div[data-ad-id] (link to /inventory/)
+      //  C) trim card: div.group.rounded-lg.border, title is a <button>, trim URL only in data-filter-href
+      const cards = Array.from(document.querySelectorAll(
+        'article, [data-ad-id], div.group.rounded-lg.border'
+      ));
+
+      const pick = (card) => {{
+        // 1) title link (aria-labelledby -> h3 a)
+        const lid = card.getAttribute('aria-labelledby');
+        const title = (lid && document.getElementById(lid)) || card.querySelector('h3');
+        if (title) {{
+          const a = title.querySelector('a[href]') || title.closest('a[href]');
+          if (a && isCar(hrefOf(a))) return hrefOf(a);
+        }}
+        // 2) inventory ad link
+        const inv = card.querySelector("a[href*='/inventory/']");
+        if (inv) return hrefOf(inv);
+        // 3) deepest /new-cars/ link (href or data-filter-href) -> the trim page
+        const cands = Array.from(card.querySelectorAll('a[href], [data-filter-href]')).map(hrefOf).filter(isCar);
+        cands.sort((x, y) => depth(y) - depth(x));
+        return cands[0] || '';
+      }};
+
+      let links = cards.map(pick);
+      // Fallback: old layout / generic selector
+      if (!links.some(Boolean)) links = Array.from(document.querySelectorAll(sel)).map(hrefOf);
+      links = links.filter(Boolean);
 
       const seen = new Set();
       const out = [];
@@ -145,6 +192,7 @@ async def wait_for_detail_ready(tab: Any, timeout: float = 35.0) -> bool:
         pass
 
     while time.time() < end:
+        await dismiss_popups(tab)
         try:
             ok = await tab.evaluate(
                 """(() => {
@@ -224,17 +272,61 @@ async def extract_detail_basic(tab: Any) -> Dict:
       // ----------------------------
       // PRICE: match SAR anywhere
       // ----------------------------
-      const sarRe = /SAR\\s*[\\d,.]+/;
+      const sarRe = /SAR\\s*[\\d,.]+|[\\d][\\d,.]*\\s*ريال/;
+      const toNum = (s) => (s ? (Number(String(s).replace(/[^\\d]/g, "")) || null) : null);
 
-      const priceNode = Array.from(document.querySelectorAll("p, span, div"))
-        .find(el => sarRe.test(cleanText(el.innerText))) || null;
+      // 1) main price box: <div class="text-3xl font-bold"><span><bdi>75,000</bdi><span>ريال</span></span></div>
+      // 2) price-comparison panel tooltip  3) any element with "SAR 123" / "123 ريال"
+      const mainPriceEl =
+        document.querySelector("div.text-3xl.font-bold") ||
+        document.querySelector("#prices-panel .rounded.bg-\\\\[\\\\#124d99\\\\]") ||
+        null;
 
-      const priceText = priceNode
-        ? (cleanText(priceNode.innerText).match(sarRe)?.[0] || cleanText(priceNode.innerText))
+      let priceText = mainPriceEl && sarRe.test(cleanText(mainPriceEl.innerText))
+        ? cleanText(mainPriceEl.innerText)
         : null;
 
-      const priceNumber = priceText
-        ? (Number(priceText.replace(/[^\d]/g, "")) || null)
+      if (!priceText) {
+        const priceNode = Array.from(document.querySelectorAll("bdi, p, span, div"))
+          .find(el => el.children.length <= 3 && sarRe.test(cleanText(el.innerText))) || null;
+        priceText = priceNode
+          ? (cleanText(priceNode.innerText).match(sarRe)?.[0] || cleanText(priceNode.innerText))
+          : null;
+      }
+
+      const priceNumber = toNum(priceText);
+
+      // Price comparison panel (#prices-panel): market range + this car's marker
+      const pp = document.querySelector("#prices-panel");
+      let priceComparison = null;
+      if (pp) {
+        const rangeSpans = Array.from(pp.querySelectorAll("div.flex.justify-between > span")).map(s => cleanText(s.innerText));
+        const marker = cleanText(pp.querySelector(".whitespace-nowrap")?.innerText) || null;
+        priceComparison = {
+          minText: rangeSpans[0] || null,
+          maxText: rangeSpans[1] || null,
+          min: toNum(rangeSpans[0]),
+          max: toNum(rangeSpans[1]),
+          markerText: marker,
+          marker: toNum(marker),
+          note: cleanText(pp.querySelector("p")?.innerText) || null,
+        };
+      }
+
+      // Inventory ad summary box (السنة / عدد الكيلومترات / ناقل الحركة / المواصفات الإقليمية) + location
+      const summaryPairs = [];
+      const summaryBox = mainPriceEl ? mainPriceEl.closest("div.space-y-4") : null;
+      if (summaryBox) {
+        summaryBox.querySelectorAll("div.grid > div.text-center").forEach(it => {
+          const label = cleanText(it.querySelector(".text-sm")?.innerText);
+          const value = cleanText(it.querySelector(".font-semibold")?.innerText);
+          if (label && value) summaryPairs.push({ label, value });
+        });
+      }
+      const summary = {};
+      for (const p of summaryPairs) summary[p.label] = p.value;
+      const location = summaryBox
+        ? (cleanText(summaryBox.querySelector("svg.lucide-map-pin")?.parentElement?.innerText) || null)
         : null;
 
       // ----------------------------
@@ -337,10 +429,15 @@ async def extract_detail_basic(tab: Any) -> Dict:
       //   descriptionText (plain text)
       //   descriptionHtml (innerHTML) optional
       // ----------------------------
+      // new layout: <div data-slot="card-content"><details><summary><div class="seo-section ...">
       const prose = document.querySelector("div[data-slot='card-content'].prose");
-      const clamp = prose ? prose.querySelector(".line-clamp-3") : null;
+      const clamp =
+        document.querySelector("[data-slot='card-content'] .seo-section") ||
+        document.querySelector(".seo-section") ||
+        (prose ? prose.querySelector(".line-clamp-3") : null);
 
-      const descriptionText = clamp ? cleanText(clamp.innerText) : null;
+      // textContent: not affected by line-clamp / closed <details>
+      const descriptionText = clamp ? (cleanText(clamp.textContent) || null) : null;
       const descriptionHtml = clamp ? (clamp.innerHTML || null) : null;
 
       const canonical = document.querySelector("link[rel='canonical']")?.href || null;
@@ -388,6 +485,10 @@ if (featuresBtn) {
 
         priceText,
         priceNumber,
+        priceComparison,
+        summaryPairs,
+        summary,
+        location,
 
         images,
         imageThumbs,
@@ -546,8 +647,12 @@ async def scrape_detail_in_detail_tab(detail_tab: Any, detail_url: str) -> Dict:
             pass
         await asyncio.sleep(0.25)
 
+    # popups can appear a few seconds after load -> clear before interacting
+    await dismiss_popups(detail_tab)
+
     # ✅ expand features before extraction
     await expand_features_if_needed(detail_tab)
+    await dismiss_popups(detail_tab)
 
     return await extract_detail_basic(detail_tab)
 
@@ -583,6 +688,8 @@ async def scrape_forever(browser):
 
         listing_tab = await browser.get("about:blank")
         detail_tab = await browser.get("about:blank")
+        await install_popup_guard(listing_tab)
+        await install_popup_guard(detail_tab)
 
         try:
             for page in range(1, MAX_PAGES + 1):
@@ -603,7 +710,7 @@ async def scrape_forever(browser):
                         continue
                     seen.add(detail_url)
 
-                    log("[detail] open", detail_url)
+                    # log("[detail] open", detail_url)
 
                     try:
                         ar_url = to_arabic_url(detail_url)
@@ -656,7 +763,7 @@ async def scrape_forever(browser):
                         await asyncio.sleep(0.25)
 
                     except Exception as e:
-                        log("[detail] FAILED", detail_url, repr(e))
+                        # log("[detail] FAILED", detail_url, repr(e))
                         now = __import__("datetime").datetime.utcnow()
                         fail_doc = {
                             "_id": detail_url,
@@ -704,6 +811,8 @@ async def scrape_new_cars(browser: Any) -> None:
     log("[list] open", start_url)
     listing_tab = await browser.get(start_url)
     detail_tab = await browser.get("about:blank")
+    await install_popup_guard(listing_tab)
+    await install_popup_guard(detail_tab)
 
     try:
         for page in range(1, max_pages + 1):
@@ -728,7 +837,7 @@ async def scrape_new_cars(browser: Any) -> None:
                     new_urls.append(u)
 
             for detail_url in new_urls:
-                log("[detail] open", detail_url)
+                # log("[detail] open", detail_url)
                 try:
                     ar_url = to_arabic_url(detail_url)
                     detail = await scrape_detail_in_detail_tab(detail_tab, ar_url)
@@ -778,11 +887,11 @@ async def scrape_new_cars(browser: Any) -> None:
                     }
 
                     await save_doc(doc)
-                    log("[detail] saved", detail_url, "imgs=", len(doc["images"]), "price=", doc["priceText"])
+                    # log("[detail] saved", detail_url, "imgs=", len(doc["images"]), "price=", doc["priceText"])
                     await asyncio.sleep(0.25)
 
                 except Exception as e:
-                    log("[detail] FAILED", detail_url, repr(e))
+                    # log("[detail] FAILED", detail_url, repr(e))
                     now = __import__("datetime").datetime.utcnow()
                     fail_doc = {
                         "_id": detail_url,
